@@ -18,13 +18,19 @@ func (d ByTime) Swap(i, j int) { d[i], d[j] = d[j], d[i] }
 func (d ByTime) Less(i, j int) bool {
 	it, err := d[i].ParseDateTime(true)
 	if err != nil {
-		it, _ = d[i].ParseDateTime(false)
+		it, err = d[i].ParseDateTime(false)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 	jt, err := d[j].ParseDateTime(true)
 	if err != nil {
-		jt, _ = d[j].ParseDateTime(false)
+		jt, err = d[j].ParseDateTime(false)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
-	return it.Unix() < jt.Unix()
+	return it.Before(jt)
 }
 
 type VBB struct {
@@ -46,6 +52,8 @@ type DepartureResult struct {
 	ServerVersion  string      `json:"serverVersion"`
 	DialectVersion string      `json:"dialectVersion"`
 	PlanRtTs       int64       `json:"planRtTs"`
+	ErrorCode      string      `json:"errorCode"`
+	ErrorText      string      `json:"errorText"`
 }
 
 type Departure struct {
@@ -82,6 +90,8 @@ func New(accessID, baseURL string) *VBB {
 }
 
 func (vbb *VBB) GetDepartures(extId string, offset time.Duration) ([]Departure, bool) {
+	log.Printf("New VBB API request for %s", extId)
+
 	t := time.Now().Add(offset)
 
 	v := url.Values{}
@@ -91,14 +101,13 @@ func (vbb *VBB) GetDepartures(extId string, offset time.Duration) ([]Departure, 
 	v.Add("date", t.Format("2006-01-02"))
 	v.Add("time", t.Format("15:04"))
 
-	client := http.Client{Timeout: time.Duration(5 * time.Second)}
+	client := http.Client{Timeout: time.Duration(10 * time.Second)}
 	resp, err := client.Get(fmt.Sprintf("%s?%s", vbb.baseURL, v.Encode()))
 	if err != nil {
 		log.Print(err)
 		return []Departure{}, false
 	}
 	defer resp.Body.Close()
-
 	decoder := json.NewDecoder(resp.Body)
 
 	dr := DepartureResult{}
@@ -107,11 +116,15 @@ func (vbb *VBB) GetDepartures(extId string, offset time.Duration) ([]Departure, 
 		log.Print(err)
 		return []Departure{}, false
 	}
+	if len(dr.ErrorCode) >= 0 && len(dr.ErrorText) > 0 {
+		log.Printf("vbb API error %s: %s", dr.ErrorCode, dr.ErrorText)
+		return []Departure{}, false
+	}
 
 	return dr.Departures, true
 }
 
-func (vbb *VBB) SortDepartures(ds []Departure, ttype, exclude string, limit int) []Departure {
+func (vbb *VBB) SortDepartures(ds []Departure, ttype, exclude string, offset time.Duration, limit int) []Departure {
 	keys := make(map[string]bool)
 	res := make([]Departure, 0)
 
@@ -122,6 +135,16 @@ func (vbb *VBB) SortDepartures(ds []Departure, ttype, exclude string, limit int)
 			continue
 		}
 		if strings.HasPrefix(d.TrainCategory, ttype) && d.Direction != exclude {
+			t, err := d.ParseDateTime(true)
+			if err != nil {
+				t, err = d.ParseDateTime(false)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+			if t.Before(time.Now().Add(offset)) {
+				continue
+			}
 			res = append(res, d)
 			keys[d.JourneyDetailRef.Ref] = true
 		}

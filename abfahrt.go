@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/buckket/kindle-abfahrt/vbb"
+	"github.com/gobuffalo/packr/v2"
+	"github.com/golang/freetype/truetype"
 	"github.com/llgcode/draw2d"
 	"github.com/llgcode/draw2d/draw2dimg"
 	"github.com/robfig/cron"
@@ -19,10 +22,65 @@ import (
 	"time"
 )
 
+type Config struct {
+	fileLocation    string
+	pagesTillRedraw int
+}
+
+type CacheContent struct {
+	timestamp  time.Time
+	departures []vbb.Departure
+	ok         bool
+}
+
+type Cache struct {
+	data map[string]CacheContent
+}
+
+func (c *Cache) IsStale(key string) bool {
+	cc, ok := c.data[key]
+	if !ok {
+		return true
+	}
+	n := time.Now()
+	if h := n.Hour(); h < 1 || h >= 7 {
+		if n.Sub(cc.timestamp) >= 90*time.Second {
+			return true
+		}
+	} else if n.Sub(cc.timestamp) >= 270*time.Second {
+		return true
+	}
+	return false
+}
+
+func (c *Cache) Get(key string) ([]vbb.Departure, bool) {
+	cc, ok := c.data[key]
+	if !ok {
+		return []vbb.Departure{}, false
+	}
+	return cc.departures, true
+}
+
+func (c *Cache) Set(key string, departures []vbb.Departure, ok bool) {
+	c.data[key] = CacheContent{
+		timestamp:  time.Now(),
+		departures: departures,
+		ok:         ok,
+	}
+}
+
+func (c *Cache) Init() {
+	c.data = make(map[string]CacheContent)
+}
+
 type Abfahrt struct {
-	vbb *vbb.VBB
+	vbb    *vbb.VBB
+	config *Config
+
+	cache Cache
 
 	imgS, imgB, imgT image.Image
+	font, fontLight  draw2d.FontData
 
 	dest *image.RGBA
 	gc   draw2d.GraphicContext
@@ -34,9 +92,15 @@ type Abfahrt struct {
 
 func main() {
 	abfahrt := Abfahrt{}
+	abfahrt.config = &Config{
+		fileLocation:    "/tmp/abfahrt.png",
+		pagesTillRedraw: 60,
+	}
 	abfahrt.vbb = vbb.New("",
 		"")
+	abfahrt.initCache()
 	abfahrt.loadStaticImages()
+	abfahrt.loadFonts()
 	abfahrt.render()
 
 	c := cron.New()
@@ -49,28 +113,45 @@ func main() {
 	abfahrt.wg.Wait()
 }
 
+func (a *Abfahrt) initCache() {
+	a.cache.Init()
+}
+
 func (a *Abfahrt) loadStaticImages() {
-	var err error
-
-	sbahn, _ := os.Open("./images/sbahn.png")
-	defer sbahn.Close()
-	a.imgS, _, err = image.Decode(sbahn)
-	if err != nil {
-		log.Fatal(err)
+	box := packr.New("images", "./images")
+	for k, v := range map[string]*image.Image{
+		"sbahn.png": &a.imgS,
+		"bus.png":   &a.imgB,
+		"tram.png":  &a.imgT,
+	} {
+		img, err := box.Find(k)
+		if err != nil {
+			log.Fatal(err)
+		}
+		*v, _, err = image.Decode(bytes.NewReader(img))
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
+}
 
-	bus, _ := os.Open("./images/bus.png")
-	defer bus.Close()
-	a.imgB, _, err = image.Decode(bus)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	tram, _ := os.Open("./images/tram.png")
-	defer bus.Close()
-	a.imgT, _, err = image.Decode(tram)
-	if err != nil {
-		log.Fatal(err)
+func (a *Abfahrt) loadFonts() {
+	box := packr.New("fonts", "./fonts")
+	a.font = draw2d.FontData{Name: "RobotoCondensed"}
+	a.fontLight = draw2d.FontData{Name: "RobotoCondensedLight"}
+	for k, v := range map[string]draw2d.FontData{
+		"RobotoCondensed.ttf":      a.font,
+		"RobotoCondensedLight.ttf": a.fontLight,
+	} {
+		f, err := box.Find(k)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tt, err := truetype.Parse(f)
+		if err != nil {
+			log.Fatal(err)
+		}
+		draw2d.RegisterFont(v, tt)
 	}
 }
 
@@ -78,62 +159,91 @@ func (a *Abfahrt) render() {
 	a.dest = image.NewRGBA(image.Rect(0, 0, 1072, 1448))
 	draw.Draw(a.dest, a.dest.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
 
-	draw2d.SetFontFolder("./fonts")
 	a.gc = draw2dimg.NewGraphicContext(a.dest)
 
+	var d, d2 []vbb.Departure
+	var ok bool
+
 	a.drawHeadline(15, a.imgS, "Schöneweide")
-	d, ok := a.vbb.GetDepartures("900192001", 15*time.Minute)
+	if a.cache.IsStale("900192001") {
+		d, ok = a.vbb.GetDepartures("900192001", 15*time.Minute)
+		a.cache.Set("900192001", d, ok)
+	} else {
+		d, ok = a.cache.Get("900192001")
+	}
 	if !ok {
 		a.drawAPIError(15)
 	} else {
-		d := a.vbb.SortDepartures(d, "S", "", 5)
+		d = a.vbb.SortDepartures(d, "S", "", 15*time.Minute, 5)
 		a.drawDepartures(15, d)
 	}
 
 	a.drawHeadline(480, a.imgT, "Wilhelminenhofstr. / Edisonstr")
-	d, ok = a.vbb.GetDepartures("900181001", 10*time.Minute)
+	if a.cache.IsStale("900181001") {
+		d, ok = a.vbb.GetDepartures("900181001", 10*time.Minute)
+		a.cache.Set("900181001", d, ok)
+	} else {
+		d, ok = a.cache.Get("900181001")
+	}
 	if !ok {
 		a.drawAPIError(480)
 	} else {
-		d2, ok := a.vbb.GetDepartures("900181701", 10*time.Minute)
+		if a.cache.IsStale("900181701") {
+			d2, ok = a.vbb.GetDepartures("900181701", 10*time.Minute)
+			a.cache.Set("900181701", d2, ok)
+		} else {
+			d2, ok = a.cache.Get("900181701")
+		}
 		if !ok {
 			a.drawAPIError(480)
 		} else {
 			d = append(d, d2...)
-			d = a.vbb.SortDepartures(d, "T", "S Schöneweide", 5)
+			d = a.vbb.SortDepartures(d, "T", "S Schöneweide", 10*time.Minute, 5)
 			a.drawDepartures(480, d)
 		}
 	}
 
 	a.drawHeadline(950, a.imgB, "Siemensstr. / Nalepastr")
-	d, ok = a.vbb.GetDepartures("900181008", 3*time.Minute)
-	if !ok {
-		a.drawAPIError(950)
-	} else {
-		d = a.vbb.SortDepartures(d, "B", "", 2)
-		a.drawDepartures(950, d)
+	if h := time.Now().Hour(); h >= 6 && h < 20 {
+		if a.cache.IsStale("900181008") {
+			d, ok = a.vbb.GetDepartures("900181008", 3*time.Minute)
+			a.cache.Set("900181008", d, ok)
+		} else {
+			d, ok = a.cache.Get("900181008")
+		}
+		if !ok {
+			a.drawAPIError(950)
+		} else {
+			d = a.vbb.SortDepartures(d, "B", "", 3*time.Minute, 2)
+			a.drawDepartures(950, d)
+		}
 	}
 
 	a.drawHeadline(1215, a.imgB, "Karlshorster Str.")
-	d, ok = a.vbb.GetDepartures("900192507", 5*time.Minute)
+	if a.cache.IsStale("900192507") {
+		d, ok = a.vbb.GetDepartures("900192507", 5*time.Minute)
+		a.cache.Set("900192507", d, ok)
+	} else {
+		d, ok = a.cache.Get("900192507")
+	}
 	if !ok {
 		a.drawAPIError(1215)
 	} else {
-		d = a.vbb.SortDepartures(d, "B", "", 2)
+		d = a.vbb.SortDepartures(d, "B", "", 5*time.Minute, 2)
 		a.drawDepartures(1215, d)
 	}
 
 	a.drawRefreshTime()
 
-	saveImage(convertToGray(a.dest))
+	a.saveImage(convertToGray(a.dest))
 
-	if a.pagesSinceFullRefresh >= 10 {
+	if a.pagesSinceFullRefresh >= a.config.pagesTillRedraw {
 		log.Printf("Updating full screen, pages was %d", a.pagesSinceFullRefresh)
-		updateScreen(true)
+		a.updateScreen(true)
 		a.pagesSinceFullRefresh = 0
 	} else {
 		log.Printf("Updating partial screen, pages is %d", a.pagesSinceFullRefresh)
-		updateScreen(false)
+		a.updateScreen(false)
 		a.pagesSinceFullRefresh++
 	}
 }
@@ -143,19 +253,8 @@ func (a *Abfahrt) drawDepartures(y float64, departures []vbb.Departure) {
 	spacing := 70
 
 	a.gc.SetFillColor(color.Black)
-	a.gc.SetFontSize(35)
 
 	for i, d := range departures {
-		a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensed"})
-		a.gc.FillStringAt(d.Product.Line, 20, row+float64(i*spacing))
-
-		a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensedLight"})
-		direction := d.Direction
-		if len(d.Direction) > 36 {
-			direction = d.Direction[:36]
-		}
-		a.gc.FillStringAt(direction, 130, row+float64(i*spacing))
-
 		t, err := d.ParseDateTime(false)
 		if err != nil {
 			log.Fatal(err)
@@ -166,17 +265,29 @@ func (a *Abfahrt) drawDepartures(y float64, departures []vbb.Departure) {
 			tRT = t
 		} else {
 			a.gc.SetFontSize(10)
-			a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensed"})
+			a.gc.SetFontData(a.font)
 			a.gc.FillStringAt("RT", 919, row+float64(i*spacing))
-			if tRT.Unix() > t.Unix() {
+			if tRT.After(t) {
 				a.gc.FillStringAt("D", 908, row+float64(i*spacing)-20)
 			}
 		}
 
 		a.gc.SetFontSize(35)
-		a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensed"})
+		a.gc.SetFontData(a.font)
+		a.gc.FillStringAt(d.Product.Line, 20, row+float64(i*spacing))
+
+		a.gc.SetFontSize(35)
+		a.gc.SetFontData(a.fontLight)
+		direction := d.Direction
+		if len(d.Direction) > 36 {
+			direction = d.Direction[:36]
+		}
+		a.gc.FillStringAt(direction, 130, row+float64(i*spacing))
+
+		a.gc.SetFontSize(35)
+		a.gc.SetFontData(a.font)
 		a.gc.FillStringAt(fmt.Sprintf("%s / %02d", tRT.Format("15:04"), relativeTime(tRT)), 800, row+float64(i*spacing))
-		a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensedLight"})
+		a.gc.SetFontData(a.fontLight)
 		a.gc.FillStringAt("min", 990, row+float64(i*spacing))
 	}
 }
@@ -189,7 +300,7 @@ func (a *Abfahrt) drawHeadline(y float64, img image.Image, text string) {
 
 	a.gc.SetFillColor(color.Black)
 	a.gc.SetFontSize(50)
-	a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensed"})
+	a.gc.SetFontData(a.font)
 	a.gc.FillStringAt(text, 95, y+60)
 
 	a.drawHorizontalLine(y + 75)
@@ -199,14 +310,14 @@ func (a *Abfahrt) drawAPIError(y float64) {
 	row := y + 140
 	a.gc.SetFillColor(color.Black)
 	a.gc.SetFontSize(35)
-	a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensed"})
+	a.gc.SetFontData(a.font)
 	a.gc.FillStringAt("API ERROR :(", 20, row)
 }
 
 func (a *Abfahrt) drawRefreshTime() {
 	a.gc.SetFillColor(color.Black)
 	a.gc.SetFontSize(50)
-	a.gc.SetFontData(draw2d.FontData{Name: "RobotoCondensedLight"})
+	a.gc.SetFontData(a.fontLight)
 	a.gc.FillStringAt(time.Now().Format("15:04"), 850, 75)
 }
 
@@ -217,6 +328,32 @@ func (a *Abfahrt) drawHorizontalLine(y float64) {
 	a.gc.LineTo(1072, y)
 	a.gc.Close()
 	a.gc.FillStroke()
+}
+
+func (a *Abfahrt) saveImage(img image.Image) {
+	out, err := os.Create(a.config.fileLocation)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := png.Encode(out, img); err != nil {
+		log.Fatal("unable to encode image")
+	}
+	return
+}
+
+func (a *Abfahrt) updateScreen(full bool) {
+	if runtime.GOARCH != "arm" {
+		return
+	}
+	args := []string{"-g", a.config.fileLocation}
+	if full {
+		args = append(args, "-f")
+	}
+	cmd := exec.Command("eips", args...)
+	err := cmd.Run()
+	if err != nil {
+		log.Fatalf("cmd.Run() failed with %s\n", err)
+	}
 }
 
 func convertToGray(img image.Image) image.Image {
@@ -232,30 +369,4 @@ func convertToGray(img image.Image) image.Image {
 func relativeTime(t time.Time) int {
 	diff := t.Sub(time.Now())
 	return int(math.Round(diff.Minutes()))
-}
-
-func saveImage(img image.Image) {
-	out, err := os.Create("/tmp/abfahrt.png")
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := png.Encode(out, img); err != nil {
-		log.Fatal("unable to encode image")
-	}
-	return
-}
-
-func updateScreen(full bool) {
-	if runtime.GOARCH != "arm" {
-		return
-	}
-	args := []string{"-g", "/tmp/abfahrt.png"}
-	if full {
-		args = append(args, "-f")
-	}
-	cmd := exec.Command("eips", args...)
-	err := cmd.Run()
-	if err != nil {
-		log.Fatalf("cmd.Run() failed with %s\n", err)
-	}
 }
