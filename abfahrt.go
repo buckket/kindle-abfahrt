@@ -6,6 +6,7 @@ import (
 	"github.com/buckket/kindle-abfahrt/vbb"
 	"github.com/gobuffalo/packr/v2"
 	"github.com/golang/freetype/truetype"
+	"github.com/kelvins/sunrisesunset"
 	"github.com/llgcode/draw2d"
 	"github.com/llgcode/draw2d/draw2dimg"
 	"github.com/robfig/cron"
@@ -15,10 +16,10 @@ import (
 	"image/png"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
-	"sync"
 	"time"
 )
 
@@ -43,11 +44,7 @@ func (c *Cache) IsStale(key string) bool {
 		return true
 	}
 	n := time.Now()
-	if h := n.Hour(); h < 1 || h >= 7 {
-		if n.Sub(cc.timestamp) >= 90*time.Second {
-			return true
-		}
-	} else if n.Sub(cc.timestamp) >= 270*time.Second {
+	if n.Sub(cc.timestamp) >= 5*time.Minute {
 		return true
 	}
 	return false
@@ -85,9 +82,10 @@ type Abfahrt struct {
 	dest *image.RGBA
 	gc   draw2d.GraphicContext
 
-	pagesSinceFullRefresh int
+	activeUntil time.Time
+	isActive    bool
 
-	wg sync.WaitGroup
+	sunrise, sunset time.Time
 }
 
 func main() {
@@ -101,16 +99,21 @@ func main() {
 	abfahrt.initCache()
 	abfahrt.loadStaticImages()
 	abfahrt.loadFonts()
-	abfahrt.render()
+	abfahrt.updateSunrise()
+	go abfahrt.clearScreen(true)
+	go abfahrt.backlight(false)
 
 	c := cron.New()
 	c.AddFunc("0 * * * * *", func() {
-		abfahrt.render()
+		abfahrt.update()
+	})
+	c.AddFunc("@daily", func() {
+		abfahrt.updateSunrise()
 	})
 	c.Start()
 
-	abfahrt.wg.Add(1)
-	abfahrt.wg.Wait()
+	http.HandleFunc("/", abfahrt.httpHandler)
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func (a *Abfahrt) initCache() {
@@ -152,6 +155,79 @@ func (a *Abfahrt) loadFonts() {
 			log.Fatal(err)
 		}
 		draw2d.RegisterFont(v, tt)
+	}
+}
+
+func (a *Abfahrt) httpHandler(w http.ResponseWriter, r *http.Request) {
+	a.activeUntil = time.Now().Add(10 * time.Minute)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "running until %s", a.activeUntil)
+	log.Printf("Incoming trigger, now active until %s", a.activeUntil.Format(time.RFC1123Z))
+	a.update()
+}
+
+func (a *Abfahrt) updateSunrise() {
+	p := sunrisesunset.Parameters{
+		Latitude:  52.4545237,
+		Longitude: 13.4956962,
+		UtcOffset: 1.0,
+		Date:      time.Now().UTC(),
+	}
+	sunrise, sunset, err := p.GetSunriseSunset()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Calculated sunrise: %s, sunset: %s", sunrise.Format("15:04"), sunset.Format("15:04"))
+	a.sunrise = sunrise
+	a.sunset = sunset
+}
+
+func (a *Abfahrt) backlight(enable bool) {
+	if runtime.GOARCH != "arm" {
+		return
+	}
+	if !enable {
+		log.Printf("Disabling backlight if enabled")
+		f, err := os.OpenFile("/sys/class/backlight/max77696-bl/brightness", os.O_WRONLY, 644)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		_, err = f.WriteString("0")
+		if err != nil {
+			log.Printf("Could not change brightness: %s", err)
+		}
+	} else {
+		if a.sunset.Hour() < time.Now().Hour() || time.Now().Hour() < a.sunrise.Hour() {
+			log.Printf("Night-time! Enabling backlight")
+			f, err := os.OpenFile("/sys/class/backlight/max77696-bl/brightness", os.O_WRONLY, 644)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer f.Close()
+			_, err = f.WriteString("100")
+			if err != nil {
+				log.Printf("Could not change brightness: %s", err)
+			}
+		}
+	}
+}
+
+func (a *Abfahrt) update() {
+	if time.Now().Before(a.activeUntil) {
+		if !a.isActive {
+			log.Printf("Display is now active (partial clear)")
+			a.isActive = true
+			go a.backlight(true)
+		}
+		a.render()
+	} else {
+		if a.isActive {
+			log.Printf("Display is now disabled (full clear)")
+			a.isActive = false
+			go a.backlight(false)
+			go a.clearScreen(true)
+		}
 	}
 }
 
@@ -237,15 +313,8 @@ func (a *Abfahrt) render() {
 
 	a.saveImage(convertToGray(a.dest))
 
-	if a.pagesSinceFullRefresh >= a.config.pagesTillRedraw {
-		log.Printf("Updating full screen, pages was %d", a.pagesSinceFullRefresh)
-		a.updateScreen(true)
-		a.pagesSinceFullRefresh = 0
-	} else {
-		log.Printf("Updating partial screen, pages is %d", a.pagesSinceFullRefresh)
-		a.updateScreen(false)
-		a.pagesSinceFullRefresh++
-	}
+	log.Printf("Updating screen")
+	a.updateScreen()
 }
 
 func (a *Abfahrt) drawDepartures(y float64, departures []vbb.Departure) {
@@ -274,7 +343,7 @@ func (a *Abfahrt) drawDepartures(y float64, departures []vbb.Departure) {
 
 		a.gc.SetFontSize(35)
 		a.gc.SetFontData(a.font)
-		a.gc.FillStringAt(d.Product.Line, 20, row+float64(i*spacing))
+		a.gc.FillStringAt(d.Product[0].Line, 20, row+float64(i*spacing))
 
 		a.gc.SetFontSize(35)
 		a.gc.SetFontData(a.fontLight)
@@ -341,18 +410,30 @@ func (a *Abfahrt) saveImage(img image.Image) {
 	return
 }
 
-func (a *Abfahrt) updateScreen(full bool) {
+func (a *Abfahrt) updateScreen() {
 	if runtime.GOARCH != "arm" {
 		return
 	}
 	args := []string{"-g", a.config.fileLocation}
+	cmd := exec.Command("eips", args...)
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("cmd.Run() failed with %s", err)
+	}
+}
+
+func (a *Abfahrt) clearScreen(full bool) {
+	if runtime.GOARCH != "arm" {
+		return
+	}
+	args := []string{"-c"}
 	if full {
 		args = append(args, "-f")
 	}
 	cmd := exec.Command("eips", args...)
 	err := cmd.Run()
 	if err != nil {
-		log.Fatalf("cmd.Run() failed with %s\n", err)
+		log.Printf("cmd.Run() failed with %s", err)
 	}
 }
 

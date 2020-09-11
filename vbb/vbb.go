@@ -43,8 +43,9 @@ type JourneyDetailRef struct {
 }
 
 type Product struct {
-	Name string `json:"name"`
-	Line string `json:"line"`
+	Name     string `json:"name"`
+	Line     string `json:"line"`
+	Category string `json:"catIn"`
 }
 
 type DepartureResult struct {
@@ -63,10 +64,8 @@ type Departure struct {
 	Date             string           `json:"date"`
 	RtTime           string           `json:"rtTime"`
 	RtDate           string           `json:"rtDate"`
-	TrainNumber      string           `json:"trainNumber"`
-	TrainCategory    string           `json:"trainCategory"`
 	Direction        string           `json:"direction"`
-	Product          Product          `json:"Product"`
+	Product          []Product        `json:"Product"`
 	JourneyDetailRef JourneyDetailRef `json:"JourneyDetailRef"`
 }
 
@@ -134,7 +133,7 @@ func (vbb *VBB) SortDepartures(ds []Departure, ttype, exclude string, offset tim
 		if _, value := keys[d.JourneyDetailRef.Ref]; value {
 			continue
 		}
-		if strings.HasPrefix(d.TrainCategory, ttype) && d.Direction != exclude {
+		if strings.HasPrefix(d.Product[0].Category, ttype) && d.Direction != exclude {
 			t, err := d.ParseDateTime(true)
 			if err != nil {
 				t, err = d.ParseDateTime(false)
