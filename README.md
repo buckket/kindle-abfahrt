@@ -48,6 +48,7 @@ A simple caching mechanism for the returned raw API data is implemented as well 
 
 - Stop running stock GUI via `stop lab126_gui`
 - Start `kindle-abfahrt` either via cron, tmux or [KUAL](https://www.mobileread.com/forums/showthread.php?t=203326)
+- Allow remote connections: `iptables -A INPUT -p tcp --dport 8080 -j ACCEPT`
 
 ## Notes
 
